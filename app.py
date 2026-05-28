@@ -5,6 +5,9 @@ from docx import Document
 from gtts import gTTS
 from audio_recorder_streamlit import audio_recorder
 import tempfile
+import os
+import re
+import time
 
 # ---------------- PAGE CONFIG ---------------- #
 
@@ -23,8 +26,10 @@ default_states = {
     "feedback_shown": False,
     "messages": [],
     "question_count": 0,
-    "audio_key": 0,               # FIX: rotating key to reset mic after each use
-    "last_spoken_index": -1,      # FIX: track which message was last spoken
+    "audio_key": 0,
+    "last_spoken_index": -1,
+    "last_audio_bytes": None,   # FIX 1: track previous audio to prevent re-trigger
+    "stop_triggered": False,    # STOP BUTTON: tracks early exit
 }
 
 for key, value in default_states.items():
@@ -34,9 +39,9 @@ for key, value in default_states.items():
 # ---------------- MAX QUESTIONS ---------------- #
 
 MAX_QUESTIONS = {
-    "HR Round": 5,        # 4-5 questions including salary discussion
-    "Technical Round": 8, # 8 technical questions
-    "Managerial Round": 5 # 5 managerial questions
+    "HR Round": 5,
+    "Technical Round": 8,
+    "Managerial Round": 5
 }
 
 # ---------------- OPENAI CLIENT ---------------- #
@@ -62,29 +67,71 @@ def extract_resume_text(uploaded_file):
         doc = Document(uploaded_file)
         for para in doc.paragraphs:
             text += para.text + "\n"
+    return text.strip()
+
+
+# FIX 6: Strip markdown symbols before passing to gTTS
+def strip_markdown(text):
+    text = re.sub(r'\*{1,3}(.*?)\*{1,3}', r'\1', text)   # bold / italic
+    text = re.sub(r'#{1,6}\s*', '', text)                  # headings
+    text = re.sub(r'`{1,3}[^`]*`{1,3}', '', text)         # code blocks
+    text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', text)  # links
+    text = re.sub(r'[-*_]{3,}', '', text)                  # horizontal rules
+    text = re.sub(r'^\s*[-*+]\s+', '', text, flags=re.MULTILINE)  # bullet points
+    text = re.sub(r'\n{2,}', '. ', text)                   # double newlines to pause
+    text = text.strip()
     return text
 
 
+# FIX 2: gTTS retry with fallback warning on internet failure
 def speak_text(text):
-    try:
-        tts = gTTS(text)
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as fp:
-            tts.save(fp.name)
-            st.audio(fp.name, format="audio/mp3")
-    except Exception as e:
-        st.warning(f"Voice output error: {e}")
+    clean_text = strip_markdown(text)   # FIX 6 applied here
+    for attempt in range(2):
+        try:
+            tts = gTTS(clean_text)
+            with tempfile.NamedTemporaryFile(
+                delete=False, suffix=".mp3"
+            ) as fp:
+                tmp_path = fp.name
+                tts.save(tmp_path)
+            st.audio(tmp_path, format="audio/mp3")
+            # cleanup temp file after use
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+            return
+        except Exception as e:
+            if attempt == 0:
+                time.sleep(1)   # wait 1 sec before retry
+            else:
+                st.warning(
+                    "⚠️ Voice playback unavailable (network issue). "
+                    "Please read the text above."
+                )
 
 
 def transcribe_audio(audio_bytes):
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_audio:
-        tmp_audio.write(audio_bytes)
-        tmp_audio_path = tmp_audio.name
-    with open(tmp_audio_path, "rb") as audio_file:
-        transcription = client.audio.transcriptions.create(
-            file=audio_file,
-            model="whisper-large-v3"
-        )
-    return transcription.text
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            delete=False, suffix=".wav"
+        ) as tmp_audio:
+            tmp_audio.write(audio_bytes)
+            tmp_path = tmp_audio.name
+        with open(tmp_path, "rb") as audio_file:
+            transcription = client.audio.transcriptions.create(
+                file=audio_file,
+                model="whisper-large-v3"
+            )
+        return transcription.text
+    finally:
+        # cleanup temp file
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
 
 
 def reset_round():
@@ -92,8 +139,10 @@ def reset_round():
     st.session_state.question_count = 0
     st.session_state.chat_complete = False
     st.session_state.feedback_shown = False
-    st.session_state.audio_key += 1       # FIX: reset mic widget
+    st.session_state.audio_key += 1
     st.session_state.last_spoken_index = -1
+    st.session_state.last_audio_bytes = None  # FIX 1: clear on reset
+    st.session_state.stop_triggered = False
 
 
 # ---------------- PROFILE SECTION ---------------- #
@@ -113,12 +162,21 @@ if not st.session_state.profile_completed:
     if uploaded_resume:
         resume_text = extract_resume_text(uploaded_resume)
         st.session_state["resume_text"] = resume_text
-        st.success("✅ Resume uploaded successfully")
+
+        # FIX 4: Warn user if resume text is empty (scanned/image PDF)
+        if not resume_text:
+            st.error(
+                "⚠️ Could not extract text from your resume. "
+                "It may be a scanned or image-based PDF. "
+                "Please upload a text-based PDF or DOCX file. "
+                "The interview will rely only on the Experience and Skills fields you filled above."
+            )
+        else:
+            st.success("✅ Resume uploaded and text extracted successfully.")
 
     st.subheader("💼 Interview Configuration")
 
     col1, col2 = st.columns(2)
-
     with col1:
         st.session_state["level"] = st.selectbox(
             "Experience Level", ["Junior", "Mid-Level", "Senior"]
@@ -181,24 +239,37 @@ if (
 
     if not st.session_state.messages:
         system_prompt = f"""
-        You are a professional interviewer.
+        You are a strict, professional interviewer.
+
         Interview Round: {round_type}
         Candidate Name: {st.session_state['name']}
         Experience: {st.session_state['experience']}
         Skills: {st.session_state['skills']}
-        Resume: {st.session_state.get('resume_text', '')}
+        Resume (ONLY source of truth for candidate background):
+        {st.session_state.get('resume_text', '')}
         Company: {st.session_state['company']}
         Position: {st.session_state['position']}
         Experience Level: {st.session_state['level']}
         Difficulty: {st.session_state['difficulty']}
+
         Instructions: {round_prompt}
-        Rules:
+
+        STRICT ANTI-HALLUCINATION RULES (NON-NEGOTIABLE):
+        - ONLY ask about projects, skills, tools, and technologies explicitly in the Resume above.
+        - Do NOT invent, assume, or guess any project or experience NOT written in the resume.
+        - Do NOT say "I see you worked on X" unless X is literally in the resume text.
+        - If the resume is empty, ask only about the skills and experience fields provided.
+        - Never fabricate project names, company names, tools, or roles.
+        - If unsure whether something is in the resume, DO NOT ask about it.
+
+        INTERVIEW RULES:
         - Ask one question at a time
         - Avoid repeated questions
         - Behave like a real interviewer
-        - Ask natural follow-up questions
+        - Ask natural follow-up questions based only on what the candidate actually says
         - Gradually increase difficulty
         - Keep interview professional
+        - Do NOT use markdown formatting like ** or ## in your responses — plain text only.
         """
 
         st.session_state.messages.append({
@@ -221,7 +292,6 @@ if (
                 st.markdown(message["content"])
 
     # ---------------- SPEAK LATEST AI RESPONSE (only once) ---------------- #
-    # FIX: Only speak when there's a new assistant message we haven't spoken yet
 
     all_messages = st.session_state.messages
     last_index = len(all_messages) - 1
@@ -233,35 +303,94 @@ if (
         speak_text(all_messages[last_index]["content"])
         st.session_state.last_spoken_index = last_index
 
+    # ---------------- STOP BUTTON ---------------- #
+
+    stop_col, _ = st.columns([2, 8])
+    with stop_col:
+        if st.button(
+            "⏹ Stop Interview",
+            key="stop_btn",
+            type="secondary",
+            use_container_width=True
+        ):
+            st.session_state.stop_triggered = True
+
+    if st.session_state.stop_triggered:
+        # Only stop if at least one answer has been given
+        user_answers = [
+            m for m in st.session_state.messages
+            if m["role"] == "user"
+        ]
+        if user_answers:
+            early_stop_message = (
+                "You have chosen to end the interview early. "
+                "Thank you for your time. "
+                "Feedback will be generated based on your answers so far."
+            )
+            with st.chat_message("assistant"):
+                st.markdown(early_stop_message)
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": early_stop_message
+            })
+            st.session_state.chat_complete = True
+            st.session_state.stop_triggered = False
+            st.rerun()
+        else:
+            st.warning(
+                "⚠️ Please answer at least one question before stopping. "
+                "There won't be enough data to generate feedback."
+            )
+            st.session_state.stop_triggered = False
+
     # ---------------- INPUT AREA ---------------- #
-    # FIX: st.chat_input must be at the top level (not inside columns)
-    # We place the mic button above it using st.columns in the main body
+    # FIX: Mic icon placed inside chat_input bar using custom CSS overlay
 
-    st.markdown("---")
-    st.markdown("### 💬 Your Response")
+    st.markdown("""
+        <style>
+        /* Push mic button to sit right of the chat input box */
+        div[data-testid="stChatInput"] {
+            position: relative;
+        }
+        .mic-wrapper {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 4px;
+        }
+        .mic-label {
+            color: gray;
+            font-size: 0.85rem;
+            margin: 0;
+        }
+        </style>
+    """, unsafe_allow_html=True)
 
-    # Mic recorder — key rotates after each submission to reset the widget
-    mic_col, label_col = st.columns([1, 6])
-
+    # Mic row — sits directly above the chat input bar, right-aligned feel
+    st.markdown('<div class="mic-wrapper">', unsafe_allow_html=True)
+    mic_col, spacer_col = st.columns([1, 11])
     with mic_col:
+        # FIX 1: rotating key prevents re-trigger; compare bytes to last recorded
         audio_bytes = audio_recorder(
             text="",
             recording_color="#e74c3c",
-            neutral_color="#6c757d",
+            neutral_color="#2c2c2c",
             icon_name="microphone",
-            icon_size="2x",
-            key=f"audio_recorder_{st.session_state.audio_key}"  # FIX: rotating key
+            icon_size="lg",
+            key=f"audio_recorder_{st.session_state.audio_key}"
         )
-
-    with label_col:
+    with spacer_col:
         st.markdown(
-            "<p style='margin-top:12px; color:gray;'>🎙️ Click mic to record your answer, or type below</p>",
+            "<p class='mic-label'>🎙️ Record answer with mic, or type below</p>",
             unsafe_allow_html=True
         )
+    st.markdown('</div>', unsafe_allow_html=True)
 
     voice_prompt = None
 
-    if audio_bytes:
+    # FIX 1: Only process audio if it's NEW bytes (not a rerun of old bytes)
+    if audio_bytes and audio_bytes != st.session_state.last_audio_bytes:
+        st.session_state.last_audio_bytes = audio_bytes
         with st.spinner("Transcribing your voice..."):
             try:
                 voice_prompt = transcribe_audio(audio_bytes)
@@ -269,10 +398,8 @@ if (
             except Exception as e:
                 st.error(f"Transcription error: {e}")
 
-    # FIX: chat_input placed at the top level — outside any column
+    # chat_input at root level (Streamlit requirement)
     typed_prompt = st.chat_input("Type your answer here...")
-
-    # ---------------- FINAL PROMPT ---------------- #
 
     prompt = typed_prompt or voice_prompt
 
@@ -288,11 +415,11 @@ if (
             "content": prompt
         })
 
-        # FIX: rotate audio key so mic resets for the next question
+        # rotate audio key so mic resets for next question
         st.session_state.audio_key += 1
+        st.session_state.last_audio_bytes = None   # FIX 1: clear so next recording is fresh
 
         # ---------------- INTERVIEW COMPLETE ---------------- #
-        # question_count tracks AI questions asked (incremented after each AI reply)
 
         if st.session_state.question_count >= MAX_QUESTIONS[round_type]:
 
@@ -315,7 +442,6 @@ if (
 
         else:
 
-            # Tell AI how many questions remain so it doesn't go infinite
             questions_remaining = MAX_QUESTIONS[round_type] - st.session_state.question_count
             control_note = {
                 "role": "system",
@@ -323,7 +449,8 @@ if (
                     f"IMPORTANT: You have asked {st.session_state.question_count} questions so far. "
                     f"You may ask {questions_remaining} more question(s) in this round. "
                     f"Total allowed: {MAX_QUESTIONS[round_type]}. "
-                    "Ask only ONE question in your next reply. Do NOT ask more than one question at a time."
+                    "Ask only ONE question in your next reply. "
+                    "Do NOT use markdown formatting — plain text only."
                 )
             }
 
@@ -345,10 +472,8 @@ if (
                 "content": response
             })
 
-            # FIX: increment question count AFTER AI asks a question
             st.session_state.question_count += 1
-
-            st.rerun()  # rerun so speak_text fires cleanly via last_spoken_index logic
+            st.rerun()
 
 
 # ---------------- FEEDBACK SECTION ---------------- #
@@ -370,9 +495,11 @@ if st.session_state.feedback_shown:
 
     st.subheader("📊 Interview Feedback")
 
+    # FIX 7 (partial): filter out system messages from feedback — cleaner + saves tokens
     conversation_history = "\n".join([
-        f"{msg['role']}: {msg['content']}"
+        f"{msg['role'].upper()}: {msg['content']}"
         for msg in st.session_state.messages
+        if msg["role"] != "system"
     ])
 
     feedback_prompt = f"""
@@ -405,10 +532,24 @@ if st.session_state.feedback_shown:
     )
 
     feedback_text = feedback_response.choices[0].message.content
-
     st.write(feedback_text)
-
     speak_text("Your interview feedback is ready.")
+
+    # FIX 7: Save session to file so progress survives refresh
+    import json
+    session_data = {
+        "name": st.session_state.get("name", ""),
+        "round_type": st.session_state.get("round_type", ""),
+        "question_count": st.session_state.get("question_count", 0),
+        "feedback": feedback_text,
+    }
+    session_json = json.dumps(session_data, indent=2)
+    st.download_button(
+        label="💾 Download Session & Feedback",
+        data=session_json,
+        file_name="interview_session.json",
+        mime="application/json"
+    )
 
     # ---------------- NEXT ROUND ---------------- #
 
@@ -423,8 +564,6 @@ if st.session_state.feedback_shown:
         st.session_state["round_type"] = next_round
         reset_round()
         st.rerun()
-
-    # ---------------- FULL RESET ---------------- #
 
     if st.button("🔄 Reset Entire Interview"):
         for key in list(st.session_state.keys()):
